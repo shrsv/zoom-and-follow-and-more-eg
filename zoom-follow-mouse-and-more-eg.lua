@@ -26,6 +26,9 @@ local DEFAULT_CROP_UPDATE_THRESHOLD = 2 -- pixels: minimum crop change to trigge
 local DEFAULT_CROP_EDGE_THRESHOLD = 5 -- pixels: increased threshold when crop is at edges
 local DEFAULT_MONITOR_WIDTH = 1920
 local DEFAULT_MONITOR_HEIGHT = 1080
+local DEFAULT_AUTO_ZOOM_ON_CLICK = true -- Auto zoom on mouse click
+local DEFAULT_AUTO_ZOOM_OUT_DELAY = 2000 -- milliseconds: delay before auto zoom out
+local DEFAULT_AUTO_FOLLOW_ON_ZOOM = true -- Auto follow mouse when zoomed
 
 -- Valid video source types
 local VALID_SOURCE_TYPES = {
@@ -58,7 +61,10 @@ local ffi_platform = {
     -- Monitors cache
     monitors = {},
     -- Mouse position cache
-    mouse_cache = {x = 0, y = 0, timestamp = 0}
+    mouse_cache = {x = 0, y = 0, timestamp = 0},
+    -- Click state
+    left_button_down = false,
+    last_click_time = 0
 }
 
 -- Initialize FFI definitions for Windows
@@ -90,6 +96,7 @@ local function init_windows_ffi()
             BOOL GetMonitorInfoA(HMONITOR, MONITORINFO*);
             typedef struct { long x; long y; } POINT;
             bool GetCursorPos(POINT* point);
+            short GetAsyncKeyState(int vKey);
         ]]
         ffi_platform.windows_loaded = true
     end)
@@ -367,6 +374,73 @@ function ffi_platform.get_mouse_pos()
     return x, y
 end
 
+-- Check if left mouse button is pressed (with click detection)
+function ffi_platform.is_left_button_clicked()
+    if not ffi_platform.initialized then
+        return false
+    end
+    
+    local is_down = false
+    
+    if ffi_platform.os_type == "Windows" then
+        local success_pcall, result = pcall(function()
+            -- VK_LBUTTON = 0x01
+            local state = ffi.C.GetAsyncKeyState(0x01)
+            -- High-order bit indicates key is down
+            return bit.band(state, 0x8000) ~= 0
+        end)
+        if success_pcall then
+            is_down = result
+        end
+        
+    elseif ffi_platform.os_type == "Linux" then
+        if ffi_platform.x11_display ~= nil then
+            local success_pcall, result = pcall(function()
+                local root_ret = ffi.new("Window[1]")
+                local child_ret = ffi.new("Window[1]")
+                local root_x = ffi.new("int[1]")
+                local root_y = ffi.new("int[1]")
+                local win_x = ffi.new("int[1]")
+                local win_y = ffi.new("int[1]")
+                local mask = ffi.new("unsigned int[1]")
+                
+                if ffi_platform.x11.XQueryPointer(ffi_platform.x11_display, ffi_platform.x11_root,
+                    root_ret, child_ret, root_x, root_y, win_x, win_y, mask) ~= 0 then
+                    -- Button1Mask = 0x0100 (left mouse button)
+                    return bit.band(mask[0], 0x0100) ~= 0
+                end
+                return false
+            end)
+            if success_pcall then
+                is_down = result
+            end
+        end
+        
+    elseif ffi_platform.os_type == "OSX" then
+        if ffi_platform.core_graphics ~= nil then
+            local success_pcall, result = pcall(function()
+                -- kCGEventLeftMouseDown = 1
+                -- Note: This requires additional CGEvent APIs which may not work reliably
+                -- For now, we'll return false on macOS (can be enhanced later)
+                return false
+            end)
+            if success_pcall then
+                is_down = result
+            end
+        end
+    end
+    
+    -- Detect click (transition from not pressed to pressed)
+    local clicked = false
+    if is_down and not ffi_platform.left_button_down then
+        clicked = true
+        ffi_platform.last_click_time = obs.os_gettime_ns() / 1000000 -- milliseconds
+    end
+    
+    ffi_platform.left_button_down = is_down
+    return clicked
+end
+
 -- Cleanup FFI platform resources
 function ffi_platform.cleanup()
     if ffi_platform.os_type == "Linux" and ffi_platform.x11_display ~= nil then
@@ -420,6 +494,12 @@ local app_state = {
     zoom_hotkey_id = nil,
     follow_hotkey_id = nil,
     debug_mode = false,
+    -- Auto-zoom settings
+    auto_zoom_on_click = DEFAULT_AUTO_ZOOM_ON_CLICK,
+    auto_zoom_out_delay = DEFAULT_AUTO_ZOOM_OUT_DELAY,
+    auto_follow_on_zoom = DEFAULT_AUTO_FOLLOW_ON_ZOOM,
+    last_activity_time = 0,
+    click_check_timer = nil,
     -- Configurable parameters
     update_interval = DEFAULT_UPDATE_INTERVAL,
     mouse_cache_duration = DEFAULT_MOUSE_CACHE_DURATION,
@@ -1063,6 +1143,112 @@ end
 -- ANIMATION HANDLERS
 -- ============================================================================
 
+-- Forward declaration: smooth_zoom_out needs to be defined before animate_zoom
+local smooth_zoom_out
+
+-- Check for mouse clicks and trigger auto-zoom
+local function check_for_clicks()
+    -- CRITICAL: Check if app_state exists
+    if not app_state or app_state.cleanup_in_progress then
+        return
+    end
+    
+    -- Only check for clicks if auto-zoom is enabled
+    if not app_state.auto_zoom_on_click then
+        return
+    end
+    
+    -- Check for click
+    local clicked = ffi_platform.is_left_button_clicked()
+    
+    if clicked then
+        log("info", "Mouse click detected")
+        
+        -- If not zoomed, zoom in
+        if not app_state.zoom.active then
+            log("info", "Zoom is NOT active, will zoom IN")
+            -- Validate or find source
+            if not app_state.source then
+                log("info", "No source set, searching for valid video source...")
+                app_state.source = find_valid_video_source()
+                if not app_state.source then
+                    log("warning", "No valid video source found for auto-zoom")
+                    return
+                end
+                log("info", "Found source: " .. obs.obs_source_get_name(app_state.source))
+            end
+            
+            -- Validate source dimensions
+            local is_valid, error_msg = validate_source_dimensions(app_state.source)
+            if not is_valid then
+                log("error", "Cannot auto-zoom: " .. tostring(error_msg))
+                return
+            end
+            log("info", "Source dimensions valid")
+            
+            log("info", "Auto-zooming in on click")
+            
+            -- Stop any existing animations
+            app_state.zoom_out_in_progress = false
+            if app_state.zoom_out_timer then
+                obs.timer_remove(app_state.zoom_out_timer)
+                app_state.zoom_out_timer = nil
+            end
+            
+            if app_state.animation_timer then
+                obs.timer_remove(animate_zoom)
+                app_state.animation_timer = nil
+            end
+            
+            -- Clean up any existing filter
+            if app_state.crop_filter and app_state.current_filter_target then
+                pcall(function()
+                    obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
+                end)
+                if app_state.crop_filter_owned then
+                    pcall(function()
+                        obs.obs_source_release(app_state.crop_filter)
+                    end)
+                end
+                app_state.crop_filter = nil
+                app_state.crop_filter_owned = false
+                app_state.current_filter_target = nil
+            end
+            
+            -- Reset zoom state
+            app_state.zoom.current = 1.0
+            app_state.zoom.active = true
+            app_state.follow.active = app_state.auto_follow_on_zoom
+            app_state.current_crop = nil
+            app_state.last_mouse_pos = {x = 0, y = 0}
+            app_state.last_crop = {left = 0, top = 0, right = 0, bottom = 0}
+            
+            -- Apply filter
+            local filter_applied = apply_crop_filter(app_state.source)
+            if not filter_applied then
+                log("error", "Failed to apply crop filter for auto-zoom")
+                app_state.zoom.active = false
+                return
+            end
+            
+            if not app_state.original_crop then
+                app_state.original_crop = {left = 0, top = 0, right = 0, bottom = 0}
+            end
+            app_state.zoom.target = app_state.zoom.value
+            app_state.zoom.start_time = obs.os_gettime_ns() / 1000000
+            app_state.last_activity_time = app_state.zoom.start_time
+            
+            -- Start animation
+            app_state.animation_timer = obs.timer_add(animate_zoom, app_state.update_interval)
+            log("info", "Auto-zoom activated with follow: " .. tostring(app_state.follow.active) .. ", zoom target: " .. app_state.zoom.target)
+        else
+            -- Already zoomed, just update activity time
+            log("info", "Already zoomed, updating activity time")
+            app_state.last_activity_time = obs.os_gettime_ns() / 1000000
+        end
+    end
+end
+
 -- Main zoom animation handler
 local function animate_zoom()
     -- CRITICAL: Check if app_state exists (prevents crash if script is unloaded)
@@ -1137,6 +1323,41 @@ local function animate_zoom()
     local mouse_delta_y = math.abs(mouse_y - app_state.last_mouse_pos.y)
     local mouse_distance = math.sqrt(mouse_delta_x * mouse_delta_x + mouse_delta_y * mouse_delta_y)
     
+    -- Update activity time if mouse moved significantly
+    if mouse_distance >= app_state.mouse_deadzone then
+        app_state.last_activity_time = obs.os_gettime_ns() / 1000000
+    end
+    
+    -- Check for auto-zoom-out timeout
+    if app_state.auto_zoom_on_click and app_state.zoom.active then
+        local current_time = obs.os_gettime_ns() / 1000000
+        local idle_time = current_time - app_state.last_activity_time
+        
+        -- Debug: Log idle time every 500ms
+        if not animate_zoom.last_idle_log then
+            animate_zoom.last_idle_log = 0
+        end
+        if current_time - animate_zoom.last_idle_log >= 500 then
+            log("info", string.format("Idle: %.0fms / %.0fms (delay until auto-zoom-out)", idle_time, app_state.auto_zoom_out_delay))
+            animate_zoom.last_idle_log = current_time
+        end
+        
+        if idle_time >= app_state.auto_zoom_out_delay then
+            log("info", "Auto-zoom-out triggered after " .. math.floor(idle_time) .. "ms idle")
+            -- Trigger zoom out
+            app_state.zoom.active = false
+            app_state.follow.active = false
+            
+            if app_state.animation_timer then
+                obs.timer_remove(animate_zoom)
+                app_state.animation_timer = nil
+            end
+            
+            smooth_zoom_out()
+            return
+        end
+    end
+    
     -- Only update crop if mouse moved beyond deadzone (prevents flickering when mouse is stationary)
     local should_update = true
     if mouse_distance < app_state.mouse_deadzone then
@@ -1158,7 +1379,7 @@ local function animate_zoom()
 end
 
 -- Smooth zoom out animation
-local function smooth_zoom_out()
+smooth_zoom_out = function()
     -- CRITICAL: Check if app_state exists and cleanup is not in progress
     if not app_state or app_state.cleanup_in_progress then
         log("warning", "Cannot start zoom out - cleanup in progress or app_state invalid")
@@ -1615,6 +1836,13 @@ local function cleanup_all_resources()
             app_state.zoom_out_timer = nil
             log("info", "Zoom out timer removed during cleanup")
         end
+        
+        -- Remove click detection timer
+        if app_state.click_check_timer then
+            obs.timer_remove(check_for_clicks)
+            app_state.click_check_timer = nil
+            log("info", "Click detection timer removed during cleanup")
+        end
     end
     
     -- Remove crop filter (protected with pcall to prevent crashes)
@@ -1672,6 +1900,11 @@ function script_properties()
     obs.obs_properties_add_float_slider(props, "zoom_speed", "Zoom Speed", 0.01, 1.0, 0.01)
     obs.obs_properties_add_float_slider(props, "follow_speed", "Follow Speed", 0.01, 1.0, 0.01)
     
+    -- Auto-zoom settings
+    obs.obs_properties_add_bool(props, "auto_zoom_on_click", "🎯 Auto Zoom on Click (Screen Studio Mode)")
+    obs.obs_properties_add_int(props, "auto_zoom_out_delay", "Auto Zoom Out Delay (ms)", 500, 10000, 100)
+    obs.obs_properties_add_bool(props, "auto_follow_on_zoom", "Auto Follow Mouse When Zoomed")
+    
     -- Advanced settings group
     local advanced_group = obs.obs_properties_create()
     obs.obs_properties_add_int(advanced_group, "update_interval", "Update Interval (ms)", 8, 100, 1)
@@ -1699,6 +1932,11 @@ function script_defaults(settings)
     obs.obs_data_set_default_double(settings, "follow_speed", 0.1)
     obs.obs_data_set_default_bool(settings, "debug_mode", false)
     
+    -- Auto-zoom defaults
+    obs.obs_data_set_default_bool(settings, "auto_zoom_on_click", DEFAULT_AUTO_ZOOM_ON_CLICK)
+    obs.obs_data_set_default_int(settings, "auto_zoom_out_delay", DEFAULT_AUTO_ZOOM_OUT_DELAY)
+    obs.obs_data_set_default_bool(settings, "auto_follow_on_zoom", DEFAULT_AUTO_FOLLOW_ON_ZOOM)
+    
     -- Advanced settings defaults
     obs.obs_data_set_default_int(settings, "update_interval", DEFAULT_UPDATE_INTERVAL)
     obs.obs_data_set_default_int(settings, "mouse_deadzone", DEFAULT_MOUSE_DEADZONE)
@@ -1722,6 +1960,26 @@ function script_update(settings)
     app_state.zoom.speed = obs.obs_data_get_double(settings, "zoom_speed")
     app_state.follow.speed = obs.obs_data_get_double(settings, "follow_speed")
     app_state.debug_mode = obs.obs_data_get_bool(settings, "debug_mode")
+    
+    -- Update auto-zoom settings
+    local old_auto_zoom = app_state.auto_zoom_on_click
+    app_state.auto_zoom_on_click = obs.obs_data_get_bool(settings, "auto_zoom_on_click")
+    app_state.auto_zoom_out_delay = obs.obs_data_get_int(settings, "auto_zoom_out_delay") or DEFAULT_AUTO_ZOOM_OUT_DELAY
+    app_state.auto_follow_on_zoom = obs.obs_data_get_bool(settings, "auto_follow_on_zoom")
+    
+    -- Start/stop click detection timer based on auto-zoom setting
+    if app_state.auto_zoom_on_click and not old_auto_zoom then
+        if not app_state.click_check_timer then
+            app_state.click_check_timer = obs.timer_add(check_for_clicks, 16)
+            log("info", "Click detection timer started")
+        end
+    elseif not app_state.auto_zoom_on_click and old_auto_zoom then
+        if app_state.click_check_timer then
+            obs.timer_remove(check_for_clicks)
+            app_state.click_check_timer = nil
+            log("info", "Click detection timer stopped")
+        end
+    end
     
     -- Update advanced configurable parameters
     app_state.update_interval = obs.obs_data_get_int(settings, "update_interval") or DEFAULT_UPDATE_INTERVAL
@@ -1783,6 +2041,15 @@ function script_load(settings)
     app_state.source = find_valid_video_source()
     if app_state.source and app_state.debug_mode then
         log("info", "Script loaded - source found but filter not applied until zoom is activated")
+    end
+    
+    -- Start click detection timer if auto-zoom is enabled
+    if app_state.auto_zoom_on_click then
+        app_state.click_check_timer = obs.timer_add(check_for_clicks, 16) -- Check ~60 times per second
+        log("info", "Click detection timer started (checking every 16ms)")
+        log("info", "Settings: auto_zoom_on_click=true, auto_zoom_out_delay=" .. app_state.auto_zoom_out_delay .. "ms, auto_follow=" .. tostring(app_state.auto_follow_on_zoom))
+    else
+        log("info", "Click detection timer NOT started (auto_zoom_on_click is disabled)")
     end
 end
 
