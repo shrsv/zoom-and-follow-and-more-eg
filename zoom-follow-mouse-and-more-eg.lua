@@ -1148,8 +1148,9 @@ local smooth_zoom_out
 
 -- Check for mouse clicks and trigger auto-zoom
 local function check_for_clicks()
-    -- CRITICAL: Check if app_state exists
+    -- CRITICAL: Check if app_state exists and cleanup is not in progress
     if not app_state or app_state.cleanup_in_progress then
+        -- Silently exit to prevent errors
         return
     end
     
@@ -1251,8 +1252,9 @@ end
 
 -- Main zoom animation handler
 local function animate_zoom()
-    -- CRITICAL: Check if app_state exists (prevents crash if script is unloaded)
-    if not app_state then
+    -- CRITICAL: Check if app_state exists and cleanup is not in progress
+    if not app_state or app_state.cleanup_in_progress then
+        -- Silently exit to prevent errors
         return
     end
     
@@ -1412,8 +1414,9 @@ smooth_zoom_out = function()
     
     -- Create timer for zoom out animation
     app_state.zoom_out_timer = obs.timer_add(function()
-        -- CRITICAL: Check if app_state exists (prevents crash if script is unloaded)
-        if not app_state then
+        -- CRITICAL: Check if app_state exists and cleanup is not in progress
+        if not app_state or app_state.cleanup_in_progress then
+            -- Silently exit to prevent errors
             return
         end
         
@@ -1739,10 +1742,10 @@ local function on_scene_change()
                 
                 local transition_timer = nil
                 transition_timer = obs.timer_add(function()
-                    -- CRITICAL: Check if app_state exists (prevents crash if script is unloaded)
-                    if not app_state then
+                    -- CRITICAL: Check if app_state exists and cleanup is not in progress
+                    if not app_state or app_state.cleanup_in_progress then
                         if transition_timer then
-                            obs.timer_remove(transition_timer)
+                            pcall(function() obs.timer_remove(transition_timer) end)
                         end
                         return
                     end
