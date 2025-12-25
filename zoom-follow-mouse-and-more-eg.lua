@@ -499,6 +499,7 @@ local app_state = {
     auto_zoom_out_delay = DEFAULT_AUTO_ZOOM_OUT_DELAY,
     auto_follow_on_zoom = DEFAULT_AUTO_FOLLOW_ON_ZOOM,
     last_activity_time = 0,
+    last_idle_log = 0,
     click_check_timer = nil,
     -- Configurable parameters
     update_interval = DEFAULT_UPDATE_INTERVAL,
@@ -1336,12 +1337,12 @@ local function animate_zoom()
         local idle_time = current_time - app_state.last_activity_time
         
         -- Debug: Log idle time every 500ms
-        if not animate_zoom.last_idle_log then
-            animate_zoom.last_idle_log = 0
+        if not app_state.last_idle_log then
+            app_state.last_idle_log = 0
         end
-        if current_time - animate_zoom.last_idle_log >= 500 then
+        if current_time - app_state.last_idle_log >= 500 then
             log("info", string.format("Idle: %.0fms / %.0fms (delay until auto-zoom-out)", idle_time, app_state.auto_zoom_out_delay))
-            animate_zoom.last_idle_log = current_time
+            app_state.last_idle_log = current_time
         end
         
         if idle_time >= app_state.auto_zoom_out_delay then
