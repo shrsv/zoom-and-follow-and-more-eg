@@ -18,7 +18,7 @@ local MAX_DISPLAYS = 32 -- Maximum displays for macOS
 -- Default values (will be overridden by script settings)
 local DEFAULT_UPDATE_INTERVAL = 16 -- milliseconds (approximately 60 FPS)
 local DEFAULT_MOUSE_CACHE_DURATION = 8 -- milliseconds (max 120 FPS)
-local DEFAULT_ZOOM_ANIMATION_DURATION = 300 -- milliseconds
+local DEFAULT_ZOOM_ANIMATION_DURATION = 100 -- milliseconds
 local DEFAULT_ZOOM_OUT_DURATION = 500 -- milliseconds
 local DEFAULT_SCENE_TRANSITION_DURATION = 300 -- milliseconds
 local DEFAULT_MOUSE_DEADZONE = 3 -- pixels: minimum mouse movement to trigger crop update
@@ -27,7 +27,7 @@ local DEFAULT_CROP_EDGE_THRESHOLD = 5 -- pixels: increased threshold when crop i
 local DEFAULT_MONITOR_WIDTH = 1920
 local DEFAULT_MONITOR_HEIGHT = 1080
 local DEFAULT_AUTO_ZOOM_ON_CLICK = true -- Auto zoom on mouse click
-local DEFAULT_AUTO_ZOOM_OUT_DELAY = 2000 -- milliseconds: delay before auto zoom out
+local DEFAULT_AUTO_ZOOM_OUT_DELAY = 500 -- milliseconds: delay before auto zoom out
 local DEFAULT_AUTO_FOLLOW_ON_ZOOM = true -- Auto follow mouse when zoomed
 
 -- Valid video source types
@@ -918,22 +918,20 @@ local function get_target_crop(mouse_x, mouse_y, current_zoom)
     -- We wait a short time after filter application before trying to get dimensions.
     local source_width, source_height
     
-    -- If filter was just applied, wait at least 50ms before trying to get dimensions
+    -- If filter was just applied, note we may need to wait for dimensions but still try immediately
+    local wait_for_dimensions = false
     if app_state._filter_just_applied and app_state._filter_apply_time then
         local current_time = obs.os_gettime_ns() / 1000000 -- milliseconds
         local elapsed = current_time - app_state._filter_apply_time
         if elapsed < 50 then
-            -- Still waiting for dimensions to become available
-            if not app_state._dimension_warning_logged then
-                if app_state.debug_mode then
-                    log("info", string.format("Waiting for source dimensions to become available (elapsed: %dms). Target: %s", 
-                        math.floor(elapsed), target_name))
-                end
+            wait_for_dimensions = true
+            if not app_state._dimension_warning_logged and app_state.debug_mode then
+                log("info", string.format("Waiting for source dimensions to become available (elapsed: %dms). Target: %s", 
+                    math.floor(elapsed), target_name))
                 app_state._dimension_warning_logged = true
             end
-            return {left = 0, top = 0, right = 0, bottom = 0}
         else
-            -- Enough time has passed, clear the flag
+            -- Enough time has passed, clear the flag so we don't stall further
             app_state._filter_just_applied = false
             app_state._filter_apply_time = nil
         end
@@ -1067,6 +1065,56 @@ end
 -- ============================================================================
 -- CROP INTERPOLATION AND UPDATE HELPERS
 -- ============================================================================
+
+-- Apply an initial crop at the given mouse position.
+-- If dimensions are not ready yet (crop is all zeros), retry a few times shortly after.
+local function apply_initial_crop_at(mouse_x, mouse_y)
+    if not app_state.zoom.active then
+        return
+    end
+
+    app_state.last_mouse_pos = {x = mouse_x, y = mouse_y}
+
+    local function apply_once()
+        local crop = get_target_crop(mouse_x, mouse_y, app_state.zoom.current)
+        local is_zero = (crop.left == 0 and crop.top == 0 and crop.right == 0 and crop.bottom == 0)
+        if is_zero then
+            return false
+        end
+
+        app_state.current_crop = crop
+        app_state.last_crop = {left = crop.left, top = crop.top, right = crop.right, bottom = crop.bottom}
+        update_crop(crop.left, crop.top, crop.right, crop.bottom)
+
+        if app_state.debug_mode then
+            log("info", string.format("Initial crop applied at (%d, %d): L=%d T=%d R=%d B=%d", 
+                mouse_x, mouse_y, crop.left, crop.top, crop.right, crop.bottom))
+        end
+        return true
+    end
+
+    if apply_once() then
+        return
+    end
+
+    -- Retry a few times (3 attempts, 20ms apart) to wait for dimensions to become available
+    local attempts = 0
+    local retry
+    retry = function()
+        -- Stop retrying if zoom was cancelled
+        if not app_state.zoom.active then
+            obs.timer_remove(retry)
+            return
+        end
+
+        attempts = attempts + 1
+        if apply_once() or attempts >= 3 then
+            obs.timer_remove(retry)
+        end
+    end
+
+    obs.timer_add(retry, 20)
+end
 
 -- Apply follow speed interpolation to crop and handle edge cases
 -- Returns the interpolated crop with anti-flickering logic for edges
@@ -1239,6 +1287,10 @@ local function check_for_clicks()
             app_state.zoom.target = app_state.zoom.value
             app_state.zoom.start_time = obs.os_gettime_ns() / 1000000
             app_state.last_activity_time = app_state.zoom.start_time
+            
+            -- IMPORTANT: Set initial crop immediately based on click position (with retries if dimensions are late)
+            local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
+            apply_initial_crop_at(mouse_x, mouse_y)
             
             -- Start animation
             app_state.animation_timer = obs.timer_add(animate_zoom, app_state.update_interval)
@@ -1651,6 +1703,10 @@ local function on_zoom_hotkey(pressed)
         app_state.zoom.target = app_state.zoom.value
         app_state.zoom.start_time = obs.os_gettime_ns() / 1000000
         
+        -- IMPORTANT: Set initial crop immediately based on current mouse position (with retries if dimensions lag)
+        local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
+        apply_initial_crop_at(mouse_x, mouse_y)
+        
         app_state.animation_timer = obs.timer_add(animate_zoom, app_state.update_interval)
         log("info", string.format("Zoom activated - target: %.2f, speed: %.2f", 
             app_state.zoom.target, app_state.zoom.speed))
@@ -1931,10 +1987,10 @@ end
 
 -- Default values
 function script_defaults(settings)
-    obs.obs_data_set_default_double(settings, "zoom_value", 2.0)
-    obs.obs_data_set_default_double(settings, "zoom_speed", 0.1)
-    obs.obs_data_set_default_double(settings, "follow_speed", 0.1)
-    obs.obs_data_set_default_bool(settings, "debug_mode", false)
+    obs.obs_data_set_default_double(settings, "zoom_value", 3.0)
+    obs.obs_data_set_default_double(settings, "zoom_speed", 0.48)
+    obs.obs_data_set_default_double(settings, "follow_speed", 0.77)
+    obs.obs_data_set_default_bool(settings, "debug_mode", true)
     
     -- Auto-zoom defaults
     obs.obs_data_set_default_bool(settings, "auto_zoom_on_click", DEFAULT_AUTO_ZOOM_ON_CLICK)
